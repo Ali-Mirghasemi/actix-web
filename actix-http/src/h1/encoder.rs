@@ -509,6 +509,8 @@ unsafe fn write_camel_case(value: &[u8], buf: *mut u8, len: usize) {
 
     // track 1 ahead of the current position since that's the location being assigned to
     let mut index = 2;
+    const WEB: &[u8] = b"web";
+    let mut web_index = 0;
 
     // remaining characters after hyphens should also be uppercase
     while let Some(&c) = iter.next() {
@@ -516,6 +518,21 @@ unsafe fn write_camel_case(value: &[u8], buf: *mut u8, len: usize) {
             // advance iter by one and uppercase if needed
             if let Some(c @ b'a'..=b'z') = iter.next() {
                 buffer[index] = c & 0b1101_1111;
+                // Check it's `web`, which should be `Web` in Camel-Case
+                if *c == WEB[0] {
+                    while let Some(c) = iter.next() {
+                        web_index += 1;
+                        index += 1;
+
+                        if web_index == WEB.len() {
+                            buffer[index] = c & 0b1101_1111;
+                            break;
+                        } 
+                        else if web_index < WEB.len() && *c != WEB[web_index] {
+                            break;
+                        }
+                    }
+                }
             }
             index += 1;
         }
@@ -529,7 +546,7 @@ mod tests {
     use std::rc::Rc;
 
     use bytes::Bytes;
-    use http::header::{AUTHORIZATION, UPGRADE_INSECURE_REQUESTS};
+    use http::header::{AUTHORIZATION, SEC_WEBSOCKET_KEY, SEC_WEBSOCKET_VERSION, UPGRADE_INSECURE_REQUESTS};
 
     use super::*;
     use crate::{
@@ -563,6 +580,11 @@ mod tests {
         head.headers
             .insert(UPGRADE_INSECURE_REQUESTS, HeaderValue::from_static("1"));
 
+        head.headers
+            .insert(SEC_WEBSOCKET_VERSION, HeaderValue::from_static("13"));
+        head.headers
+            .insert(SEC_WEBSOCKET_KEY, HeaderValue::from_static("Fru0CutlLuNTiA/cYWpUkA=="));
+
         let mut head = RequestHeadType::Owned(head);
 
         let _ = head.encode_headers(
@@ -579,6 +601,8 @@ mod tests {
         assert!(data.contains("Content-Type: plain/text\r\n"));
         assert!(data.contains("Date: date\r\n"));
         assert!(data.contains("Upgrade-Insecure-Requests: 1\r\n"));
+        assert!(data.contains("Sec-WebSocket-Version: 13\r\n"));
+        assert!(data.contains("Sec-WebSocket-Key: Fru0CutlLuNTiA/cYWpUkA==\r\n"));
 
         let _ = head.encode_headers(
             &mut bytes,
@@ -599,6 +623,10 @@ mod tests {
             .insert(CONTENT_TYPE, HeaderValue::from_static("plain/text"));
         head.headers
             .append(CONTENT_TYPE, HeaderValue::from_static("xml"));
+        head.headers
+            .append(SEC_WEBSOCKET_VERSION, HeaderValue::from_static("13"));
+        head.headers
+            .append(SEC_WEBSOCKET_KEY, HeaderValue::from_static("Fru0CutlLuNTiA/cYWpUkA=="));
 
         let mut head = RequestHeadType::Owned(head);
         let _ = head.encode_headers(
@@ -613,6 +641,8 @@ mod tests {
         assert!(data.contains("content-type: xml\r\n"));
         assert!(data.contains("content-type: plain/text\r\n"));
         assert!(data.contains("date: date\r\n"));
+        assert!(data.contains("sec-websocket-version: 13\r\n"));
+        assert!(data.contains("sec-websocket-key: Fru0CutlLuNTiA/cYWpUkA==\r\n"));
     }
 
     #[actix_rt::test]
