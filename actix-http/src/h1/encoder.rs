@@ -117,7 +117,7 @@ pub(crate) trait MessageType: Sized {
                 } else {
                     dst.put_slice(b"connection: upgrade\r\n")
                 }
-            },
+            }
             ConnectionType::KeepAlive if version < Version::HTTP_11 => {
                 if camel_case {
                     dst.put_slice(b"Connection: keep-alive\r\n")
@@ -609,6 +609,16 @@ mod tests {
         assert!(data.contains("Upgrade-Insecure-Requests: 1\r\n"));
         assert!(data.contains("Sec-WebSocket-Version: 13\r\n"));
         assert!(data.contains("Sec-WebSocket-Key: Fru0CutlLuNTiA/cYWpUkA==\r\n"));
+
+        let _ = head.encode_headers(
+            &mut bytes,
+            Version::HTTP_11,
+            BodySize::None,
+            ConnectionType::Upgrade,
+            &ServiceConfig::default(),
+        );
+        let data = String::from_utf8(Vec::from(bytes.split().freeze().as_ref())).unwrap();
+        assert!(data.contains("Connection: Upgrade\r\n"));
 
         let _ = head.encode_headers(
             &mut bytes,

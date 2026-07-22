@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     path::{Component, Path, PathBuf},
     str::FromStr,
 };
@@ -70,12 +71,16 @@ impl PathBufWrap {
             .map_err(|_| UriSegmentError::NotValidUtf8)?;
 
         // disallow decoding `%2F` into `/`
-        if segment_count != path.matches('/').count() + 1 {
-            return Err(UriSegmentError::BadChar('/'));
+        if let Cow::Owned(ref path) = path {
+            if segment_count != path.matches('/').count() + 1 {
+                return Err(UriSegmentError::BadChar('/'));
+            }
         }
 
         for segment in path.split('/') {
-            if segment == ".." {
+            if segment == "." {
+                return Err(UriSegmentError::BadStart('.'));
+            } else if segment == ".." {
                 segment_count -= 1;
                 buf.pop();
             } else if !hidden_files && segment.starts_with('.') {
@@ -177,6 +182,11 @@ mod tests {
             PathBufWrap::parse_path("/test/.tt", true).unwrap().0,
             PathBuf::from_iter(vec!["test", ".tt"])
         );
+
+        assert_eq!(
+            PathBufWrap::parse_path("/test/./file.txt", true).map(|t| t.0),
+            Err(UriSegmentError::BadStart('.'))
+        );
     }
 
     #[test]
@@ -196,6 +206,14 @@ mod tests {
                 .unwrap()
                 .0,
             PathBuf::from_iter(vec!["etc/passwd"])
+        );
+    }
+
+    #[test]
+    fn encoded_slash_is_rejected() {
+        assert_eq!(
+            PathBufWrap::parse_path("/test%2Ffile.txt", false),
+            Err(UriSegmentError::BadChar('/'))
         );
     }
 

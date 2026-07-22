@@ -82,7 +82,9 @@ where
     ) -> Self::Future {
         if state.contains_key(&field.form_field_name) {
             match duplicate_field {
-                DuplicateField::Ignore => return Box::pin(ready(Ok(()))),
+                DuplicateField::Ignore => {
+                    return Box::pin(async move { discard_field(field, limits).await });
+                }
 
                 DuplicateField::Deny => {
                     return Box::pin(ready(Err(MultipartError::DuplicateField(
@@ -159,7 +161,9 @@ where
     ) -> Self::Future {
         if state.contains_key(&field.form_field_name) {
             match duplicate_field {
-                DuplicateField::Ignore => return Box::pin(ready(Ok(()))),
+                DuplicateField::Ignore => {
+                    return Box::pin(async move { discard_field(field, limits).await });
+                }
 
                 DuplicateField::Deny => {
                     return Box::pin(ready(Err(MultipartError::DuplicateField(
@@ -312,6 +316,16 @@ impl Limits {
     }
 }
 
+/// Drain a field that will not be retained while still accounting for form limits.
+#[doc(hidden)]
+pub async fn discard_field(mut field: Field, limits: &mut Limits) -> Result<(), MultipartError> {
+    while let Some(chunk) = field.try_next().await? {
+        limits.try_consume_limits(chunk.len(), false)?;
+    }
+
+    Ok(())
+}
+
 /// Typed `multipart/form-data` extractor.
 ///
 /// To extract typed data from a multipart stream, the inner type `T` must implement the
@@ -322,6 +336,107 @@ impl Limits {
 /// `multipart/related`, or non-multipart media types.
 ///
 /// Add a [`MultipartFormConfig`] to your app data to configure extraction.
+///
+/// # Basic Use
+///
+/// Each field type should implement the [`FieldReader`] trait:
+///
+/// ```rust
+/// use actix_multipart::form::{tempfile::TempFile, text::Text, MultipartForm};
+///
+/// #[derive(MultipartForm)]
+/// struct ImageUpload {
+///     description: Text<String>,
+///     timestamp: Text<i64>,
+///     image: TempFile,
+/// }
+/// ```
+///
+/// # Optional and List Fields
+///
+/// You can also use [`Vec<T>`](Vec) and [`Option<T>`](Option) provided that `T: FieldReader`.
+///
+/// A [`Vec`] field corresponds to an upload with multiple parts under the [same field
+/// name](https://www.rfc-editor.org/rfc/rfc7578#section-4.3).
+///
+/// ```rust
+/// use actix_multipart::form::{tempfile::TempFile, text::Text, MultipartForm};
+///
+/// #[derive(MultipartForm)]
+/// struct Form {
+///     category: Option<Text<String>>,
+///     files: Vec<TempFile>,
+/// }
+/// ```
+///
+/// # Field Renaming
+///
+/// You can use the `#[multipart(rename = "foo")]` attribute to receive a field by a different name.
+///
+/// ```rust
+/// use actix_multipart::form::{tempfile::TempFile, MultipartForm};
+///
+/// #[derive(MultipartForm)]
+/// struct Form {
+///     #[multipart(rename = "files[]")]
+///     files: Vec<TempFile>,
+/// }
+/// ```
+///
+/// # Field Limits
+///
+/// You can use the `#[multipart(limit = "<size>")]` attribute to set field level limits. The limit
+/// string is parsed using [`bytesize`].
+///
+/// Note: the form is also subject to the global limits configured using [`MultipartFormConfig`].
+///
+/// ```rust
+/// use actix_multipart::form::{tempfile::TempFile, text::Text, MultipartForm};
+///
+/// #[derive(MultipartForm)]
+/// struct Form {
+///     #[multipart(limit = "2 KiB")]
+///     description: Text<String>,
+///
+///     #[multipart(limit = "512 MiB")]
+///     files: Vec<TempFile>,
+/// }
+/// ```
+///
+/// # Unknown Fields
+///
+/// By default fields with an unknown name are ignored. They can be rejected using the
+/// `#[multipart(deny_unknown_fields)]` attribute:
+///
+/// ```rust
+/// use actix_multipart::form::MultipartForm;
+///
+/// #[derive(MultipartForm)]
+/// #[multipart(deny_unknown_fields)]
+/// struct Form {}
+/// ```
+///
+/// # Duplicate Fields
+///
+/// The behaviour for when multiple fields with the same name are received can be changed using the
+/// `#[multipart(duplicate_field = "<behavior>")]` attribute:
+///
+/// - "ignore": (default) Extra fields are ignored. I.e., the first one is persisted.
+/// - "deny": A [`MultipartError::DuplicateField`] error response is returned.
+/// - "replace": Each field is processed, but only the last one is persisted.
+///
+/// Note that [`Vec`] fields will ignore this option.
+///
+/// ```rust
+/// use actix_multipart::form::MultipartForm;
+///
+/// #[derive(MultipartForm)]
+/// #[multipart(duplicate_field = "deny")]
+/// struct Form {}
+/// ```
+///
+/// [`bytesize`]: https://docs.rs/bytesize/2
+/// [`MultipartError::DuplicateField`]: crate::MultipartError::DuplicateField
 #[derive(Deref, DerefMut)]
 pub struct MultipartForm<T: MultipartCollect>(pub T);
 
@@ -710,6 +825,32 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
     }
 
+    #[actix_rt::test]
+    async fn test_discarded_fields_count_towards_total_limit() {
+        let srv = actix_test::start(|| {
+            App::new()
+                .route("/unknown", web::post().to(test_upload_limits_memory))
+                .route("/duplicate", web::post().to(test_duplicate_ignore_route))
+                .app_data(
+                    MultipartFormConfig::default()
+                        .memory_limit(usize::MAX)
+                        .total_limit(20),
+                )
+        });
+
+        let mut form = multipart::Form::default();
+        form.add_text("field", "7 bytes");
+        form.add_text("unknown", "this string is 28 bytes long");
+        let response = send_form(&srv, form, "/unknown").await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        let mut form = multipart::Form::default();
+        form.add_text("field", "first_value");
+        form.add_text("field", "this string is 28 bytes long");
+        let response = send_form(&srv, form, "/duplicate").await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
     /// Test the Limits.
     #[derive(MultipartForm)]
     struct TestMemoryUploadLimits {
@@ -822,7 +963,7 @@ mod tests {
         let response = send_form(&srv, form, "/").await;
         assert_eq!(response.status(), StatusCode::OK);
 
-        // Exceeds the the 30 byte limit
+        // Exceeds the 30 byte limit
         let mut form = multipart::Form::default();
         form.add_text("field", "this string is more than 30 bytes long");
         let response = send_form(&srv, form, "/").await;

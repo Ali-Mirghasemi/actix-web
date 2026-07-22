@@ -2,6 +2,34 @@
 
 ## Unreleased
 
+## 3.13.1
+
+- Fix HTTP/1 WebSocket upgrade responses being overwritten with `Connection: close` when the upgraded request payload remains open. [#4115]
+
+[#4115]: https://github.com/actix/actix-web/issues/4115
+
+## 3.13.0
+
+- When configured, gracefully close HTTP/1 connections after early responses to unread request bodies. [#3967]
+- Wake HTTP/1 payload receivers with an incomplete-payload error when the sender is dropped before EOF. [#3100]
+- Update `foldhash` dependency to `0.2`.
+
+[#3967]: https://github.com/actix/actix-web/issues/3967
+[#3100]: https://github.com/actix/actix-web/issues/3100
+
+## 3.12.1
+
+**Notice: This release contains a security fix. Users are encouraged to update to this version ASAP.**
+
+- SECURITY: Reject HTTP/1 requests with ambiguous request framing from `Content-Length` and `Transfer-Encoding` headers to prevent request smuggling.
+- Encode the HTTP/1 `Connection: Upgrade` header in Camel-Case when camel-case header formatting is enabled.[#3953]
+- Fix `HeaderMap` iterators' `len()` and `size_hint()` implementations for multi-value headers.
+- Update `rand` dependency to `0.10`.
+- Update `sha1` dependency to `0.11`.
+- Add `ServiceConfigBuilder::h1_write_buffer_size()` and `HttpServiceBuilder::h1_write_buffer_size()`.
+
+[#3953]: https://github.com/actix/actix-web/pull/3953
+
 ## 3.12.0
 
 - Minimum supported Rust version (MSRV) is now 1.88.

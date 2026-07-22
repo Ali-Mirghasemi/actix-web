@@ -1,9 +1,16 @@
 #[cfg(feature = "openssl")]
 extern crate tls_openssl as openssl;
 
-use std::{sync::mpsc, thread, time::Duration};
+use std::{
+    convert::Infallible,
+    sync::{mpsc, Arc},
+    thread,
+    time::Duration,
+};
 
-use actix_web::{web, App, HttpRequest, HttpResponse, HttpServer};
+use actix_web::{rt::time::sleep, web, App, HttpRequest, HttpResponse, HttpServer};
+use bytes::Bytes;
+use futures_util::stream;
 
 #[actix_rt::test]
 async fn test_start() {
@@ -74,6 +81,74 @@ async fn test_start() {
     srv.stop(false).await;
 }
 
+#[actix_rt::test]
+async fn test_app_data_dropped_after_graceful_shutdown_with_slow_request() {
+    struct State {
+        _data: Arc<String>,
+    }
+
+    async fn echo(_body: web::Json<String>) -> HttpResponse {
+        HttpResponse::Ok().finish()
+    }
+
+    let (weak_data, app_data) = {
+        let data = Arc::new("data".to_owned());
+        (Arc::downgrade(&data), web::Data::new(State { _data: data }))
+    };
+
+    let server = HttpServer::new(move || {
+        App::new()
+            .app_data(app_data.clone())
+            .service(web::resource("/echo").route(web::post().to(echo)))
+    })
+    .workers(1)
+    .shutdown_timeout(1)
+    .bind(("127.0.0.1", 0))
+    .unwrap();
+
+    let addr = server.addrs()[0];
+    let server = server.run();
+    let server_handle = server.handle();
+
+    let send_request = async move {
+        sleep(Duration::from_millis(100)).await;
+
+        let slow_body = stream::unfold(0, |idx| async move {
+            if idx < 8 {
+                sleep(Duration::from_millis(200)).await;
+                Some((Ok::<_, Infallible>(Bytes::from_static(b" ")), idx + 1))
+            } else {
+                None
+            }
+        });
+
+        let client = awc::Client::default();
+        let _ = client
+            .post(format!("http://{addr}/echo"))
+            .insert_header(("content-type", "application/json"))
+            .send_stream(slow_body)
+            .await;
+    };
+
+    let graceful_stop = async move {
+        sleep(Duration::from_millis(300)).await;
+        server_handle.stop(true).await;
+    };
+
+    let (server_res, (), ()) = tokio::join!(server, send_request, graceful_stop);
+    server_res.unwrap();
+
+    for _ in 0..20 {
+        sleep(Duration::from_millis(100)).await;
+
+        if weak_data.upgrade().is_none() {
+            return;
+        }
+    }
+
+    panic!("app data still referenced after graceful shutdown");
+}
+
 #[cfg(feature = "openssl")]
 fn ssl_acceptor() -> openssl::ssl::SslAcceptorBuilder {
     use openssl::{
@@ -82,10 +157,10 @@ fn ssl_acceptor() -> openssl::ssl::SslAcceptorBuilder {
         x509::X509,
     };
 
-    let rcgen::CertifiedKey { cert, key_pair } =
+    let rcgen::CertifiedKey { cert, signing_key } =
         rcgen::generate_simple_self_signed(["localhost".to_owned()]).unwrap();
     let cert_file = cert.pem();
-    let key_file = key_pair.serialize_pem();
+    let key_file = signing_key.serialize_pem();
 
     let cert = X509::from_pem(cert_file.as_bytes()).unwrap();
     let key = PKey::private_key_from_pem(key_file.as_bytes()).unwrap();
@@ -216,4 +291,49 @@ async fn test_tcp_nodelay_enabled() {
 #[actix_rt::test]
 async fn test_tcp_nodelay_disabled() {
     assert_tcp_nodelay_config(false).await;
+}
+
+#[actix_rt::test]
+#[cfg(windows)]
+async fn test_dual_stack_ipv6_on_windows() {
+    let (tx, rx) = mpsc::channel();
+
+    thread::spawn(move || {
+        actix_rt::System::new()
+            .block_on(async {
+                let srv = HttpServer::new(|| {
+                    App::new().service(
+                        web::resource("/")
+                            .route(web::to(|| async { HttpResponse::Ok().body("test") })),
+                    )
+                })
+                .workers(1)
+                .disable_signals()
+                .bind("[::]:0")
+                .unwrap();
+
+                let port = srv.addrs()[0].port();
+                let srv = srv.run();
+
+                tx.send((srv.handle(), port)).unwrap();
+                srv.await
+            })
+            .unwrap();
+    });
+
+    let (srv, port) = rx.recv().unwrap();
+
+    let client = awc::Client::builder()
+        .connector(awc::Connector::new().timeout(Duration::from_secs(1)))
+        .finish();
+
+    let response = client
+        .get(format!("http://127.0.0.1:{port}"))
+        .send()
+        .await
+        .unwrap();
+
+    assert!(response.status().is_success());
+
+    srv.stop(false).await;
 }
